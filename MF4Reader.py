@@ -126,6 +126,12 @@ class MF4Reader:
                 for msg in log_f:
                     msg_sa = self.sa_from_id(msg.arbitration_id)
                     msg_id = self.pgn_from_id(msg.arbitration_id, with_priority=True)
+                    if Message.is_pdu1(msg.arbitration_id):
+                        # zero DA
+                        msg_da = msg_id & 0xFF
+                        msg_id = msg_id & 0x1FFF00
+                    else:
+                        msg_da = None
 
                     if msg_id in unknown_list:
                         continue
@@ -138,7 +144,10 @@ class MF4Reader:
                     # append
                     for msg_log in msg_list:
                         if msg_log.get_pgn() == msg_id:
-                            msg_log.add_frame(t, data, msg_sa, channel)
+                            if msg_da is None:
+                                msg_log.add_frame(t, data, msg_sa, channel)
+                            else:
+                                msg_log.add_frame(t, data, msg_da, msg_sa, channel)
                             break
                     else:
                         # append unknown list
@@ -167,9 +176,9 @@ class MF4Reader:
             return None
 
     @staticmethod
-    def __plot(ax, t, x, signal: Signal, trace_data: 'MF4Reader.TraceData'):
+    def __plot(ax, t, x, signal: Signal, title: str):
         ax.step(t, x, 'o-', where='post')
-        title = signal.name + trace_data.to_title()
+        title = signal.name + title
         ax.set_title(title)
         ax.xaxis.set_minor_locator(tck.AutoMinorLocator())
         ax.grid(visible=True, which='major')
@@ -239,6 +248,24 @@ class MF4Reader:
         else:
             return self.figure.axes
 
+    def __append_figure(self, t, y, signal, title):
+        # plot
+        plt.ion()
+        if self.figure is None:
+            self.figure = plt.figure()
+            self.figure.canvas.mpl_connect('close_event', self.__clear_fig)
+            self._plot_idx = 1
+            new_axes = self.figure.subplots(1, 1)
+            self.__plot(new_axes, t, y, signal, title)
+            self._plot_signal_list = [(signal, title)]
+        else:
+            new_axes = self.__refresh_plot(self._plot_idx)
+            self.__plot(new_axes[self._plot_idx - 1], t, y, signal, title)
+            self._plot_signal_list.append((signal, title))
+        plt.show()
+        # increment num of plots
+        self._plot_idx += 1
+
     def plot_signal(self, msg_name, sig_name=None):
         # get signal data
         try:
@@ -273,27 +300,82 @@ class MF4Reader:
                     Y_data.append(sig.bytes2data(msg_data[1]))
                     T_data.append(msg_data[0])
 
-                # plot
-                plt.ion()
-                if self.figure is None:
-                    self.figure = plt.figure()
-                    self.figure.canvas.mpl_connect('close_event', self.__clear_fig)
-                    self._plot_idx = 1
-                    new_axes = self.figure.subplots(1, 1)
-                    self.__plot(new_axes, T_data, Y_data, sig, trace_data)
-                    self._plot_signal_list = [(sig, trace_data)]
-                else:
-                    new_axes = self.__refresh_plot(self._plot_idx)
-                    self.__plot(new_axes[self._plot_idx - 1], T_data, Y_data, sig, trace_data)
-                    self._plot_signal_list.append((sig, trace_data))
-                plt.show()
-                # increment num of plots
-                self._plot_idx += 1
+                self.__append_figure(T_data, Y_data, sig, trace_data.to_title())
 
             plt.draw()
             plt.pause(0.1)
         except MdfException as ex:
             print(ex)
+
+    def plot_dtc(self, spn, fmi):
+        # find sig and msg
+        dtc_active_msg = 'DM01'
+        sig_PL = 'PLStatus'  # Protection Lamp
+        sig_AWL = 'AWLStatus'  # Amber        Warning        Lamp
+        sig_RLS = 'RSLState'  # Red        Stop        Lamp
+        sig_MIL = 'MILStatus'  # Malfunction        Indicator        Lamp
+        # FlashAmberWarningLamp ???
+        # FlashMalfuncIndicatorLamp ???
+        # FlashProtectLamp ???
+        # FlashRedStopLamp ???
+
+        dbc_msg = self.database.get_message(dtc_active_msg)
+        if dbc_msg is None:
+            print('No prototype for DTC message found')
+            return
+        dtc_lamps =[dbc_msg.get_signal(sig_PL),
+                    dbc_msg.get_signal(sig_AWL),
+                    dbc_msg.get_signal(sig_RLS),
+                    dbc_msg.get_signal(sig_MIL)]
+        dtc_signals = [dbc_msg.get_signal('DTC1'),
+                       dbc_msg.get_signal('DTC2'),
+                       dbc_msg.get_signal('DTC3'),
+                       dbc_msg.get_signal('DTC4'),
+                       dbc_msg.get_signal('DTC5')]
+        if None in dtc_lamps or None in dtc_signals:
+            print('Unsupported DTC frame format. Missing signals')
+            return
+
+        # fetch all message frames
+        trace_data = self.get_message(dtc_active_msg)
+        if trace_data is None:
+            print(f'No DTC active message in the logs.')
+            return
+
+        y_data = dict()
+        for lamp in dtc_lamps:
+            y_data[lamp.name] = []
+        t_data = []
+        for entry in trace_data.trace:
+            # check if contains correct DTC
+            dtc_list = []
+            for dts_sig in dtc_signals:
+                dtc = dts_sig.bytes2data(entry[1])
+                dtc = int(dtc)
+                if dtc != 0x0:  # dtc != 0xFFFF_FFFF
+                    dtc_list.append(dtc)
+
+            for dtc in dtc_list:
+                # remove CM and OC(4th byte)
+                tmp_val = dtc & 0xFF_FFFF
+                # get FMI
+                dtc_fmi = (tmp_val & 0x1F_0000) >> 16
+                # restore SPN(4th method, new)
+                dtc_spn = dtc & 0xFFFF
+                dtc_spn = dtc_spn + ((dtc & 0xE0_0000) >> 5)
+
+                # compare
+                if dtc_spn == spn and dtc_fmi == fmi:
+                    # found DTC of interest
+                    t_data.append(entry[0])
+                    for lamp in dtc_lamps:
+                        y_data[lamp.name].append(lamp.bytes2data(entry[1]))
+        # draw
+        for lamp in dtc_lamps:
+            self.__append_figure(t_data, y_data[lamp.name], lamp, trace_data.to_title())
+
+        plt.draw()
+        plt.pause(0.1)
 
     def get_messages_from_source(self, source_address: int) -> list:
         out = []
@@ -366,6 +448,9 @@ class MF4Reader:
             if sa not in self._sources:
                 self._sources[sa] = MF4Reader.MsgSource(sa)
             self._sources[sa].add_frame(time, data, channel)
+
+        def has_sa(self, sa: int):
+            return sa in self._sources
 
         def get_trace(self, trace_data: 'MF4Reader.TraceData' = None) -> 'MF4Reader.TraceData':
             # create output struct
@@ -442,10 +527,11 @@ class MF4Reader:
                 # select source
                 if len(self._sources) > 1:
                     sa_key = MF4Reader.TraceData.select_sa(list(self._sources.keys()))
-                    trace_data.SA = sa_key
+                    # trace_data.SA = sa_key
                 else:
                     sa_key = list(self._sources.keys())[0]
-                    trace_data.SA = None
+                    # trace_data.SA = None
+                trace_data.SA = sa_key
                 return self._sources[sa_key].get_trace(trace_data=trace_data)
             else:
                 return None
@@ -466,6 +552,12 @@ class MF4Reader:
         def get_pgn(self):
             # zero DA
             return self.msg.pgn & 0x1FFF00
+
+        def has_sa(self, sa: int):
+            for da in self._destinations:
+                if self._destinations[da].has_sa(sa):
+                    return True
+            return False
 
         def get_frame_trace(self, msg_name: str) -> 'MF4Reader.TraceData | None':
             if self.msg.name == msg_name:
@@ -513,7 +605,13 @@ if __name__ == '__main__':
             continue
         if len(sig_name) == 1:
             sig_name = None
+        elif sig_name[0].lower() == 'dtc':
+            if len(sig_name) != 3:
+                print('Bad DTC format. Expected: DTC.SPN.FMI')
+                continue
+            spn = int(sig_name[1])
+            fmi = int(sig_name[2])
+            mReader.plot_dtc(spn, fmi)
         else:
             sig_name = sig_name[1]
-
-        mReader.plot_signal(msg_name, sig_name=sig_name)
+            mReader.plot_signal(msg_name, sig_name=sig_name)

@@ -25,7 +25,7 @@ class Message:
     def add_sig(self, signal):
         self.signals.append(signal)
 
-    def get_signal(self, sig_name):
+    def get_signal(self, sig_name) -> 'Signal':
         for sig in self.signals:
             if sig.name == sig_name:
                 return sig
@@ -322,6 +322,7 @@ class Database:
         self.messages: list[Message] = []
         self.name_space = Database.NameSpace()
         self.unused_val_tables = []
+        self.unused_sig_msg = None
         self.comments = []
         self.defines = []
         self.etc = []
@@ -356,7 +357,12 @@ class Database:
                         break
                     msg.add_sig(Signal(n_line))
 
-                self.messages.append(msg)
+                if msg.name == self.MSG_UNUSED:
+                    if self.unused_sig_msg is not None:
+                        raise Exception('Multiple unused signals messages in ' + str(file))
+                    self.unused_sig_msg = msg
+                else:
+                    self.messages.append(msg)
             elif line.startswith(Database.KW_COMMENT):
                 self.comments.append(line)
             elif line.startswith(Database.KW_ATTR_DEFINE):
@@ -376,19 +382,26 @@ class Database:
                         attr.add_value(val_setter)
                         break
             elif line.startswith(Database.KW_SIG_VAL_TABLE):
-                # TODO parse and pass into signal
+                def __apply_vt_sig(message, vt) -> bool:
+                    for sig in message.signals:
+                        if sig.name == vt.signal_name:
+                            sig.value_table = vt
+                            return True
+                    else:
+                        return False
+
                 vt_sig = ValueTable(line[len(Database.KW_SIG_VAL_TABLE):])
                 for msg in self.messages:
                     if msg.id == vt_sig.msg_id:
-                        for sig in msg.signals:
-                            if sig.name == vt_sig.signal_name:
-                                sig.value_table = vt_sig
-                                break
-                        else:
+                        if not __apply_vt_sig(msg, vt_sig):
                             raise Exception(f"Can't find signal for value table: {line}")
                         break
                 else:
-                    raise Exception(f"Can't find message for value table: {line}")
+                    if self.unused_sig_msg is not None and self.unused_sig_msg.id == vt_sig.msg_id:
+                        if not __apply_vt_sig(self.unused_sig_msg, vt_sig):
+                            raise Exception(f"Can't find signal for value table: {line}")
+                    else:
+                        raise Exception(f"Can't find message for value table: {line}")
                 self.etc.append(line)
             else:
                 if len(line) > 0:
@@ -408,6 +421,8 @@ class Database:
         out += '\n'.join(self.unused_val_tables) + '\n\n'
 
         # messages
+        if self.unused_sig_msg is not None:
+            out += str(self.unused_sig_msg) + '\n\n'
         out += '\n\n'.join((str(x) for x in self.messages)) + '\n\n'
 
         # comments
@@ -453,7 +468,7 @@ class Database:
         a_val.set_default_value(def_val)
         self.defines.append(a_val)
 
-    def merge(self, other_database):
+    def merge(self, other_database: 'Database'):
         # TODO ?
         # self.net_nodes = None
 
@@ -464,6 +479,21 @@ class Database:
         self.comments += other_database.comments
         self.defines += other_database.defines
         self.etc += other_database.etc
+
+        if self.unused_sig_msg is not None:
+            if other_database.unused_sig_msg is None:
+                # leave self as is
+                pass
+            else:
+                # merge
+                self.unused_sig_msg.signals += other_database.unused_sig_msg.signals
+        elif other_database.unused_sig_msg is not None:
+            if self.unused_sig_msg is None:
+                # just copy(?)
+                self.unused_sig_msg = other_database.unused_sig_msg
+            else:
+                # merge
+                self.unused_sig_msg.signals += other_database.unused_sig_msg.signals
 
     class NameSpace:
         def __init__(self):
